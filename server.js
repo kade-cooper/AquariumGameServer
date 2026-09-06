@@ -217,6 +217,25 @@ function verifyJwt(token) {
   }
 }
 
+// Twitch's helix /extensions/pubsub rejects app access tokens with 403
+// "JWT could not be verified" — it requires an extension JWT signed here by
+// the EBS (role "external", pinned to the channel, send permission for the
+// broadcast topic). Sign a short-lived one per broadcast with the same
+// decoded extension secret used to verify viewer JWTs.
+function signBroadcastJwt(channelId) {
+  if (!SECRET_KEY) return null;
+  const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const header = b64url({ alg: "HS256", typ: "JWT" });
+  const payload = b64url({
+    exp: Math.floor(Date.now() / 1000) + 30,
+    channel_id: String(channelId),
+    role: "external",
+    pubsub_perms: { send: ["broadcast"] }
+  });
+  const sig = crypto.createHmac("sha256", SECRET_KEY).update(header + "." + payload).digest("base64url");
+  return header + "." + payload + "." + sig;
+}
+
 /* ---------------- app access token + Helix calls ---------------- */
 
 let tokenCache = null;
@@ -287,18 +306,27 @@ async function broadcast(channelId, obj) {
   // network hiccup) must never escape as an unhandled rejection and crash the
   // process — log it and skip this broadcast instead.
   try {
-    const token = await getAppToken();
-    if (!token) return;
-    // Twitch's "Send Extension PubSub Message" (helix /extensions/pubsub)
-    // requires a non-empty target array — "broadcast" reaches every viewer
-    // listening on the channel's broadcast topic (the client's
-    // Twitch.ext.listen("broadcast", ...)). An empty target is rejected with
-    // 400 "Missing required parameter target".
+    // Auth: helix /extensions/pubsub needs an EBS-signed extension JWT (an
+    // app access token is rejected with 403 "JWT could not be verified"). The
+    // JWT carries the channel id and "broadcast" send permission; the body
+    // then targets the channel's broadcast topic — every viewer listening on
+    // Twitch.ext.listen("broadcast", ...) receives it. broadcaster_id is only
+    // allowed alongside is_global_broadcast: false.
+    const token = signBroadcastJwt(channelId);
+    if (!token) {
+      console.error("Broadcast to " + channelId + " skipped: no extension secret (set TWITCH_EXTENSION_SECRET)");
+      return;
+    }
     const res = await fetch(HELIX + "/extensions/pubsub", {
       method: "POST",
-      headers: helixHeaders(token),
+      headers: {
+        Authorization: "Bearer " + token,
+        "Client-Id": CLIENT_ID,
+        "Content-Type": "application/json"
+      },
       body: JSON.stringify({
-        broadcaster_id: channelId,
+        broadcaster_id: String(channelId),
+        is_global_broadcast: false,
         target: ["broadcast"],
         message: JSON.stringify(obj)
       })
