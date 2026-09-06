@@ -2,12 +2,14 @@
   "name": "aquarium-game-ebs",
   "version": "1.0.0",
   "private": true,
-  "description": "Aquarium Game extension backend (EBS) — zero runtime dependencies, Node >= 18 (global fetch).",
+  "description": "Aquarium Game extension backend (EBS) — Node >= 18 (global fetch). Leaderboard storage via Turso (libSQL) with a local-file fallback.",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@libsql/client": "^0.14.0"
+  }
 }

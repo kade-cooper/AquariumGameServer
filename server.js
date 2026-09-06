@@ -50,6 +50,12 @@ const CLIENT_SECRET = process.env.TWITCH_EXTENSION_SECRET || "";
 // Twitch signs viewer/EBS JWTs with the base64-DECODED secret bytes, not the
 // base64 string as shown in the console. HMAC with the decoded key.
 const SECRET_KEY = CLIENT_SECRET ? Buffer.from(CLIENT_SECRET, "base64") : null;
+// Optional durable leaderboard storage via Turso (libSQL). With these env
+// vars set, each channel's board is one JSON value in Turso; otherwise the
+// server falls back to local JSON files under DATA_DIR (dev/testing only —
+// those files are lost when Render recycles free-tier instances).
+const TURSO_URL = process.env.TURSO_DATABASE_URL || "";
+const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN || "";
 const EXTENSION_VERSION = process.env.EXTENSION_VERSION || "0.0.1";
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const INSECURE = process.env.ALLOW_INSECURE === "1";
@@ -73,6 +79,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 const FALLBACK_CONFIG = {
   timer: { minSec: 45, maxSec: 150 },
   spawn: { catchWindowSec: 20, catchLimit: -1 },
+  leaderboard: { maxEntries: 20 },
   rarities: {
     bronze: { label: "Bronze", color: "#cd7f32", multiplier: 1, qteCircles: 3, qteTime: 8 },
     silver: { label: "Silver", color: "#c0c0c0", multiplier: 2, qteCircles: 4, qteTime: 7 },
@@ -113,11 +120,53 @@ const send = (res, status, obj) => {
 };
 
 const lbFile = (channelId) => path.join(DATA_DIR, "leaderboard_" + String(channelId).replace(/[^a-zA-Z0-9_-]/g, "") + ".json");
+const lbKey = (channelId) => "lb:" + String(channelId).replace(/[^a-zA-Z0-9_-]/g, "");
 
-function loadLeaderboard(channelId) {
+/* ---------------- leaderboard storage ---------------- */
+// Prefer Turso (a remote `kv` table) over local JSON files. Each channel's
+// board stays one JSON value, so the in-memory logic (sort/trim/broadcast)
+// is identical either way — only the persistence differs.
+let turso = null;
+let tursoReady = false;
+async function initTurso() {
+  if (!TURSO_URL) return;
+  try {
+    const { createClient } = require("@libsql/client");
+    turso = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN || undefined });
+    await turso.execute({ sql: "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)", args: [] });
+    tursoReady = true;
+    console.log("leaderboard storage: Turso enabled");
+  } catch (e) {
+    turso = null;
+    console.error("Turso init failed — falling back to local files: " + (e && e.message ? e.message : e));
+  }
+}
+
+async function loadLeaderboard(channelId) {
+  if (tursoReady) {
+    try {
+      const rs = await turso.execute({ sql: "SELECT v FROM kv WHERE k = ?", args: [lbKey(channelId)] });
+      const row = rs.rows && rs.rows[0];
+      return row && row.v != null ? JSON.parse(row.v) : [];
+    } catch (e) {
+      console.error("lb read failed (" + channelId + "): " + (e && e.message ? e.message : e));
+      return [];
+    }
+  }
   try { return JSON.parse(fs.readFileSync(lbFile(channelId), "utf8")); } catch (e) { return []; }
 }
-function saveLeaderboard(channelId, board) {
+async function saveLeaderboard(channelId, board) {
+  if (tursoReady) {
+    try {
+      await turso.execute({
+        sql: "INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        args: [lbKey(channelId), JSON.stringify(board)]
+      });
+      return;
+    } catch (e) {
+      console.error("lb write failed (" + channelId + "): " + (e && e.message ? e.message : e));
+    }
+  }
   fs.writeFileSync(lbFile(channelId), JSON.stringify(board, null, 2));
 }
 
@@ -426,7 +475,7 @@ async function handle(req, res) {
   if (url.pathname === "/api/leaderboard" && req.method === "GET") {
     const channelId = url.searchParams.get("channel_id") || "";
     if (!channelId) { send(res, 400, { error: "channel_id is required" }); return; }
-    send(res, 200, { leaderboard: loadLeaderboard(channelId) });
+    send(res, 200, { leaderboard: await loadLeaderboard(channelId) });
     return;
   }
 
@@ -541,20 +590,27 @@ async function handle(req, res) {
     const entry = { username, fishName, rarity, weightKg, score, costBits, ts: Date.now() };
     if (transactionId) entry.transactionId = String(transactionId);
 
-    const board = loadLeaderboard(channelId);
-    const maxEntries = Math.min(100, Math.max(1, Number(body.maxEntries) || 20));
+    const board = await loadLeaderboard(channelId);
+    // Board size comes from the channel's own config (the client never sent
+    // maxEntries, so a hardcoded default silently capped every board at 20).
+    const cfgLb = getConfig(channelId).leaderboard || {};
+    const cfgMax = Math.floor(Number(cfgLb.maxEntries));
+    const maxEntries = Math.min(500, Math.max(1, Number.isFinite(cfgMax) && cfgMax >= 1 ? cfgMax : (Number(body.maxEntries) || 20)));
     // Retries of a paid share carry the SAME transaction id (the client never
     // re-charges) — if it's already recorded, don't double-post.
     if (transactionId && board.some(e => e.transactionId === String(transactionId))) {
       const existing = board.slice(0, maxEntries);
+      const dupRank = existing.findIndex(e => e.transactionId === String(transactionId));
       broadcast(channelId, { type: "leaderboard", leaderboard: existing }).catch((e) => console.error("pubsub:", e.message));
-      send(res, 200, { ok: true, leaderboard: existing, duplicate: true });
+      send(res, 200, { ok: true, leaderboard: existing, duplicate: true, onLeaderboard: true, rank: dupRank >= 0 ? dupRank + 1 : null });
       return;
     }
     board.push(entry);
     board.sort((a, b) => b.score - a.score || b.costBits - a.costBits);
+    const entryRank = board.indexOf(entry) + 1; // 1-based rank within the sorted board
+    const onLeaderboard = entryRank <= maxEntries;
     const trimmed = board.slice(0, maxEntries);
-    saveLeaderboard(channelId, trimmed);
+    await saveLeaderboard(channelId, trimmed);
 
     let chatResult = null;
     const chatMessage = costBits === 0
@@ -568,7 +624,13 @@ async function handle(req, res) {
     }
     broadcast(channelId, { type: "leaderboard", leaderboard: trimmed }).catch((e) => console.error("pubsub:", e.message));
 
-    send(res, 200, { ok: true, leaderboard: trimmed, chat: chatResult });
+    send(res, 200, {
+      ok: true,
+      leaderboard: trimmed,
+      chat: chatResult,
+      onLeaderboard: onLeaderboard,
+      rank: onLeaderboard ? entryRank : null
+    });
     return;
   }
 
@@ -585,7 +647,7 @@ async function handle(req, res) {
     }
     if (payload.role !== "broadcaster") { send(res, 403, { error: "Broadcaster only" }); return; }
     if (String(payload.channel_id) !== String(channelId)) { send(res, 403, { error: "Channel mismatch" }); return; }
-    saveLeaderboard(channelId, []);
+    await saveLeaderboard(channelId, []);
     broadcast(channelId, { type: "leaderboard", leaderboard: [] }).catch((e) => console.error("pubsub:", e.message));
     send(res, 200, { ok: true, leaderboard: [] });
     return;
@@ -612,12 +674,15 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log("Aquarium Game EBS listening on http://localhost:" + PORT);
-  console.log("  client id:      " + (CLIENT_ID || "(unset)"));
-  console.log("  extension ver:  " + EXTENSION_VERSION);
-  console.log("  data dir:       " + DATA_DIR);
-  if (INSECURE) console.log("  ⚠ ALLOW_INSECURE mode — no JWT verification / Twitch calls");
+initTurso().finally(() => {
+  server.listen(PORT, () => {
+    console.log("Aquarium Game EBS listening on http://localhost:" + PORT);
+    console.log("  client id:      " + (CLIENT_ID || "(unset)"));
+    console.log("  extension ver:  " + EXTENSION_VERSION);
+    console.log("  data dir:       " + DATA_DIR);
+    console.log("  leaderboard:    " + (TURSO_URL ? "Turso (remote)" : "local files (ephemeral on free tier)"));
+    if (INSECURE) console.log("  ⚠ ALLOW_INSECURE mode — no JWT verification / Twitch calls");
+  });
 });
 
 // Last-resort guards: an async rejection (e.g. a Twitch API call made outside
