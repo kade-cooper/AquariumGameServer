@@ -286,11 +286,14 @@ async function sendChatMessage(broadcasterId, message) {
   const res = await fetch(HELIX + "/extensions/chat", {
     method: "POST",
     headers: helixHeaders(token),
+    // Send Extension Chat Message expects the chat text in the "text" field
+    // (not "message") — sending "message" gets 400 "Missing required
+    // parameter text".
     body: JSON.stringify({
       broadcaster_id: broadcasterId,
       extension_id: CLIENT_ID,
       extension_version: EXTENSION_VERSION,
-      message: message
+      text: message
     })
   });
   if (!res.ok) {
