@@ -19,7 +19,15 @@
  *
  * Environment variables:
  *   TWITCH_EXTENSION_ID       (required in production)  = extension Client ID
- *   TWITCH_EXTENSION_SECRET   (required in production)  = extension Client Secret
+ *   TWITCH_EXTENSION_SECRET   (required in production)  = Extension Secret (base64, ends "=";
+ *                                                          signs/verifies viewer JWTs only)
+ *   TWITCH_API_CLIENT_SECRET  (recommended in production) = Twitch API Client Secret — a
+ *                                                          DIFFERENT credential, used for
+ *                                                          OAuth app-access tokens (Helix).
+ *                                                          If unset, falls back to the
+ *                                                          Extension Secret (old behaviour;
+ *                                                          OAuth will reject it with
+ *                                                          "invalid client secret").
  *   EXTENSION_VERSION         default "0.0.1"           = must match a hosted/test version
  *   PORT                      default 8081
  *   DATA_DIR                  default ./data
@@ -50,6 +58,11 @@ const CLIENT_SECRET = process.env.TWITCH_EXTENSION_SECRET || "";
 // Twitch signs viewer/EBS JWTs with the base64-DECODED secret bytes, not the
 // base64 string as shown in the console. HMAC with the decoded key.
 const SECRET_KEY = CLIENT_SECRET ? Buffer.from(CLIENT_SECRET, "base64") : null;
+// The OAuth app-access-token / Helix calls need the "Twitch API Client Secret",
+// which is a SEPARATE credential from the Extension Secret above. Twitch rejects
+// the Extension Secret here with 403 "invalid client secret". Falls back to the
+// Extension Secret so older deployments keep working (with a loud warning).
+const API_CLIENT_SECRET = process.env.TWITCH_API_CLIENT_SECRET || CLIENT_SECRET;
 // Optional durable leaderboard storage via Turso (libSQL). With these env
 // vars set, each channel's board is one JSON value in Turso; otherwise the
 // server falls back to local JSON files under DATA_DIR (dev/testing only —
@@ -70,6 +83,14 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
     console.error("Set TWITCH_EXTENSION_ID and TWITCH_EXTENSION_SECRET (or ALLOW_INSECURE=1 for local testing).");
     process.exit(1);
   }
+}
+if (!INSECURE && CLIENT_ID && !process.env.TWITCH_API_CLIENT_SECRET) {
+  console.warn(
+    "NOTE: TWITCH_API_CLIENT_SECRET is not set — using the Extension Secret for OAuth app-token " +
+    "requests. Twitch requires the separate 'Twitch API Client Secret' (Dev Console > extension > " +
+    "Twitch API client configuration) and will reject the Extension Secret with " +
+    "403 'invalid client secret'."
+  );
 }
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -202,14 +223,14 @@ let tokenCache = null;
 
 async function getAppToken() {
   if (tokenCache && tokenCache.expires_at > Date.now() + 60000) return tokenCache.access_token;
-  if (!CLIENT_ID || !CLIENT_SECRET) return null;
+  if (!CLIENT_ID || !API_CLIENT_SECRET) return null;
   const res = await fetch("https://id.twitch.tv/oauth2/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "client_credentials",
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
+      client_secret: API_CLIENT_SECRET
     })
   });
   const data = await res.json();
