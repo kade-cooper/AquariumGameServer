@@ -287,6 +287,28 @@ async function broadcast(channelId, obj) {
   }
 }
 
+/* ---------------- display names via identity link ---------------- */
+
+const userNameCache = new Map(); // user_id -> { name, at }
+async function fetchUserDisplayName(userId) {
+  if (!userId) return null;
+  const hit = userNameCache.get(userId);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.name;
+  try {
+    const token = await getAppToken();
+    if (!token) return null;
+    const res = await fetch(HELIX + "/users?id=" + encodeURIComponent(userId), { headers: helixHeaders(token) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const u = data.data && data.data[0];
+    const name = u && u.display_name ? String(u.display_name).trim().slice(0, 25) : "";
+    if (name) userNameCache.set(userId, { name: name, at: Date.now() });
+    return name || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 /* ---------------- per-channel state + synced spawn loop ---------------- */
 
 const channels = new Map(); // channelId -> { lastSeen, config, activeSpawn, nextSpawnAt, loopTimer }
@@ -510,7 +532,7 @@ async function handle(req, res) {
     const { jwt, channelId, spawnId, qteMs } = body;
     if (!channelId || !spawnId) { send(res, 400, { error: "channelId and spawnId are required" }); return; }
 
-    let uid = null, username = null;
+    let uid = null, username = null, linkedUserId = null;
     if (INSECURE) {
       uid = String(body.opaqueUserId || "insecure-user");
       username = String(body.username || "viewer").slice(0, 25);
@@ -519,8 +541,12 @@ async function handle(req, res) {
       if (!payload) { send(res, 401, { error: "Invalid JWT" }); return; }
       if (String(payload.channel_id) !== String(channelId)) { send(res, 403, { error: "Channel mismatch" }); return; }
       uid = payload.opaque_user_id;
-      username = null; // display names arrive via bits transactions; use opaque short id
+      // Identity-linked viewers carry their real Twitch user id — resolve a
+      // verified display name so raffle winners and catch announcements show
+      // real usernames instead of opaque ids.
+      linkedUserId = (payload.user_id != null) ? String(payload.user_id) : null;
     }
+    if (!username) username = await fetchUserDisplayName(linkedUserId);
 
     const ch = getChannel(channelId);
     const spawn = ch.activeSpawn;
@@ -537,10 +563,17 @@ async function handle(req, res) {
       send(res, 200, { status: "already" });
       return;
     }
-    spawn.claims.push({ uid: uid, username: username || uid.slice(0, 8), at: Date.now(), qteMs: Math.max(0, Number(qteMs) || 0) });
+    // A viewer who hasn't shared their Twitch identity has no resolvable real
+    // name — catch announcements and raffle results simply show them as
+    // "anonymous" (the uid is still tracked internally for winner matching).
+    const claim = { uid: uid, username: username || "anonymous", at: Date.now(), qteMs: Math.max(0, Number(qteMs) || 0) };
+    spawn.claims.push(claim);
     spawn.claimed.add(uid);
 
     if (spawn.catchLimit === -1) {
+      // Unlimited fish: let every viewer see who landed it (overlay toast).
+      broadcast(channelId, { type: "catch_announcement", spawnId: spawn.spawnId, uid: uid,
+        username: claim.username, fish: spawn.fish, weightKg: spawn.weightKg });
       send(res, 200, { status: "caught", remaining: -1 });
       return;
     }
@@ -558,30 +591,50 @@ async function handle(req, res) {
     const body = await readJson(req);
     const { jwt, channelId, transactionId, fish } = body;
     if (!channelId || !fish) { send(res, 400, { error: "channelId and fish are required" }); return; }
+    // Anonymous sharing was removed — every leaderboard entry carries the
+    // viewer's real Twitch name. Reject stale clients still sending the old
+    // flag so "anonymous user" can never appear on a board.
+    if (fish && fish.anonymous) { send(res, 400, { error: "Anonymous sharing is disabled" }); return; }
     const costBits = Math.max(0, Number(fish.costBits) || 0);
     const freeShare = costBits === 0;
 
     let username = null;
+    let linkedUserId = null;
     if (INSECURE) {
       username = String(fish.username || "viewer").slice(0, 25);
     } else {
       const payload = verifyJwt(jwt);
       if (!payload) { send(res, 401, { error: "Invalid JWT" }); return; }
       if (String(payload.channel_id) !== String(channelId)) { send(res, 403, { error: "Channel mismatch" }); return; }
+      // A viewer who accepted identity sharing carries their real Twitch user
+      // id in the JWT — that lets us look up a verified display name below.
+      linkedUserId = (payload.user_id != null) ? String(payload.user_id) : null;
       if (freeShare) {
-        // Free share (0 bits): no purchase happened, so no transaction to verify.
-        username = String(fish.username || "viewer").slice(0, 25);
+        // Free share (0 bits): no purchase happened, so no transaction to
+        // verify. The display name is resolved from the identity link below
+        // (Helix /users), never trusted from the client.
       } else {
         if (!transactionId) { send(res, 400, { error: "transactionId is required" }); return; }
         try {
           const tx = await verifyTransaction(transactionId, costBits);
-          username = String(fish.username || tx.displayName || "viewer").slice(0, 25);
+          // The purchaser's display name comes from Twitch's VERIFIED
+          // transaction (user_name / user_login) — never trust the
+          // client-sent username for paid shares. (The old code read
+          // tx.displayName, which is the product's name, and fell back to
+          // the client's opaque viewer id, e.g. "U_abc123".)
+          username = String(tx.user_name || tx.user_login || "").trim().slice(0, 25) || null;
         } catch (e) {
           send(res, 400, { error: "Transaction verification failed: " + e.message });
           return;
         }
       }
     }
+    // Resolve a verified display name: paid shares already got one from the
+    // transaction; otherwise identity-linked viewers are looked up by their
+    // real user id. Only fall back to the client-supplied name when neither
+    // source exists (anonymous/unlinked viewer).
+    if (!username) username = await fetchUserDisplayName(linkedUserId);
+    if (!username) username = String(fish.username || "viewer").slice(0, 25);
 
     const rarity = String(fish.rarity || "bronze").slice(0, 20);
     const weightKg = Math.max(0, Number(fish.weightKg) || 0);
