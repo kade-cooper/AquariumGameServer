@@ -539,11 +539,20 @@ async function handle(req, res) {
     const score = Math.max(0, Number(fish.score) || 0);
     const fishName = String(fish.fishName || "Fish").slice(0, 40);
     const entry = { username, fishName, rarity, weightKg, score, costBits, ts: Date.now() };
+    if (transactionId) entry.transactionId = String(transactionId);
 
     const board = loadLeaderboard(channelId);
+    const maxEntries = Math.min(100, Math.max(1, Number(body.maxEntries) || 20));
+    // Retries of a paid share carry the SAME transaction id (the client never
+    // re-charges) — if it's already recorded, don't double-post.
+    if (transactionId && board.some(e => e.transactionId === String(transactionId))) {
+      const existing = board.slice(0, maxEntries);
+      broadcast(channelId, { type: "leaderboard", leaderboard: existing }).catch((e) => console.error("pubsub:", e.message));
+      send(res, 200, { ok: true, leaderboard: existing, duplicate: true });
+      return;
+    }
     board.push(entry);
     board.sort((a, b) => b.score - a.score || b.costBits - a.costBits);
-    const maxEntries = Math.min(100, Math.max(1, Number(body.maxEntries) || 20));
     const trimmed = board.slice(0, maxEntries);
     saveLeaderboard(channelId, trimmed);
 
