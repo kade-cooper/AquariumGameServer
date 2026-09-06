@@ -609,6 +609,8 @@ async function handle(req, res) {
       // A viewer who accepted identity sharing carries their real Twitch user
       // id in the JWT — that lets us look up a verified display name below.
       linkedUserId = (payload.user_id != null) ? String(payload.user_id) : null;
+      console.log("[share] " + channelId + " free=" + freeShare + " linkedUser=" + (linkedUserId || "NONE") +
+        " opaque=" + String(payload.opaque_user_id || "").slice(0, 8));
       if (freeShare) {
         // Free share (0 bits): no purchase happened, so no transaction to
         // verify. The display name is resolved from the identity link below
@@ -635,6 +637,7 @@ async function handle(req, res) {
     // source exists (anonymous/unlinked viewer).
     if (!username) username = await fetchUserDisplayName(linkedUserId);
     if (!username) username = String(fish.username || "viewer").slice(0, 25);
+    console.log("[share] resolved username=" + username + (linkedUserId && username === String(fish.username || "viewer") ? " (HELIX LOOKUP FAILED — fell back to client name)" : ""));
 
     const rarity = String(fish.rarity || "bronze").slice(0, 20);
     const weightKg = Math.max(0, Number(fish.weightKg) || 0);
