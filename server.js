@@ -289,13 +289,17 @@ async function broadcast(channelId, obj) {
   try {
     const token = await getAppToken();
     if (!token) return;
+    // Twitch's "Send Extension PubSub Message" (helix /extensions/pubsub)
+    // requires a non-empty target array — "broadcast" reaches every viewer
+    // listening on the channel's broadcast topic (the client's
+    // Twitch.ext.listen("broadcast", ...)). An empty target is rejected with
+    // 400 "Missing required parameter target".
     const res = await fetch(HELIX + "/extensions/pubsub", {
       method: "POST",
       headers: helixHeaders(token),
       body: JSON.stringify({
-        target: [],
         broadcaster_id: channelId,
-        is_broadcast: true,
+        target: ["broadcast"],
         message: JSON.stringify(obj)
       })
     });
