@@ -722,18 +722,31 @@ async function handle(req, res) {
     const entryRank = board.indexOf(entry) + 1; // 1-based rank within the sorted board
     const onLeaderboard = entryRank <= maxEntries;
     const trimmed = board.slice(0, maxEntries);
-    await saveLeaderboard(channelId, trimmed);
 
-    let chatResult = null;
+    // Chat is a REQUIRED part of every share: the fish is shared in chat AND
+    // added to the leaderboard in one action (paid shares spend Bits on the
+    // chat post). Post to chat FIRST — if it can't send (broadcaster hasn't
+    // granted this extension the Chat permission, Chat Capabilities is off in
+    // the console, rate limited, etc.), refuse the share instead of silently
+    // recording a leaderboard-only entry. Nothing is persisted, so the viewer
+    // keeps the fish and retries once chat works (paid retries re-use the same
+    // transaction id, so Bits are never charged twice).
     const chatMessage = costBits === 0
       ? "@" + username + " caught a " + rarityLabel(rarity) + " " + fishName + " (" + fmtKg(weightKg) + ")! 🌊"
       : "@" + username + " caught a " + rarityLabel(rarity) + " " + fishName + " (" + fmtKg(weightKg) +
         ") worth " + costBits.toLocaleString("en-US") + " bits! 🌊";
+    let chatResult = null;
     try {
       chatResult = await sendChatMessage(channelId, chatMessage);
     } catch (e) {
-      console.error("chat:", e.message);
+      console.error("chat failed: " + (e && e.message ? e.message : e));
+      send(res, 502, {
+        error: "Chat posting failed — the streamer must allow this extension to send chat messages (channel Extensions settings) and the extension needs Chat Capabilities enabled. Nothing was shared; try again once chat is enabled."
+      });
+      return;
     }
+
+    await saveLeaderboard(channelId, trimmed);
     broadcast(channelId, { type: "leaderboard", leaderboard: trimmed }).catch((e) => console.error("pubsub:", e.message));
 
     send(res, 200, {
